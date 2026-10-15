@@ -10,6 +10,7 @@ const GraphicsAPI = Renderer.API;
 const Texture = GraphicsAPI.Texture;
 const CellSize = @import("size.zig").CellSize;
 const Overlay = @import("Overlay.zig");
+const BlockMarkers = @import("BlockMarkers.zig");
 
 const log = std.log.scoped(.renderer_image);
 
@@ -36,6 +37,8 @@ pub const State = struct {
 
     /// Overlays
     overlay_placements: std.ArrayListUnmanaged(Placement),
+    block_marker_placements: std.ArrayListUnmanaged(Placement) = .empty,
+    block_markers_loaded: bool = false,
 
     pub const empty: State = .{
         .images = .empty,
@@ -54,6 +57,7 @@ pub const State = struct {
         }
         self.kitty_placements.deinit(alloc);
         self.overlay_placements.deinit(alloc);
+        self.block_marker_placements.deinit(alloc);
     }
 
     /// Upload any images to the GPU that need to be uploaded,
@@ -96,6 +100,7 @@ pub const State = struct {
         kitty_below_text,
         kitty_above_text,
         overlay,
+        block_markers,
     };
 
     /// Draw the given named set of placements.
@@ -114,6 +119,7 @@ pub const State = struct {
             .kitty_below_text => self.kitty_placements.items[self.kitty_bg_end..self.kitty_text_end],
             .kitty_above_text => self.kitty_placements.items[self.kitty_text_end..],
             .overlay => self.overlay_placements.items,
+            .block_markers => self.block_marker_placements.items,
         };
 
         for (placements) |p| {
@@ -175,6 +181,54 @@ pub const State = struct {
                     .type = .triangle_strip,
                     .vertex_count = 4,
                 },
+            });
+        }
+    }
+
+    /// Solid gutter markers reuse five one-pixel textures and the existing
+    /// image shader. Storage is bounded by visible blocks, not output size.
+    pub fn blockMarkersUpdate(self: *State, alloc: Allocator, markers: []const BlockMarkers.Marker, viewport: @import("size.zig").Size) !void {
+        self.block_marker_placements.clearRetainingCapacity();
+        if (markers.len == 0) {
+            if (!self.block_markers_loaded) return;
+            inline for (std.enums.values(BlockMarkers.Color)) |color| {
+                if (self.images.getPtr(.{ .block_marker = color })) |data| data.image.markForUnload();
+            }
+            self.block_markers_loaded = false;
+            return;
+        }
+        self.block_markers_loaded = true;
+        const width = BlockMarkers.gutterWidth(viewport.padding.left);
+        if (width == 0) return;
+        const cell_width = viewport.cell.width;
+        const cells_left = (viewport.padding.left + cell_width - 1) / cell_width;
+        for (markers) |marker| {
+            const id: Id = .{ .block_marker = marker.color };
+            const existing = self.images.get(id);
+            if (existing == null or existing.?.image.isUnloading()) {
+                var pixel: [4]u8 = switch (marker.color) {
+                    .unknown => .{ 130, 130, 130, 200 },
+                    .running => .{ 205, 170, 80, 230 },
+                    .success => .{ 100, 170, 125, 230 },
+                    .failure => .{ 210, 100, 100, 230 },
+                    .selected => .{ 100, 165, 245, 255 },
+                };
+                const generation = if (existing) |v| v.generation + 1 else 1;
+                try self.prepImage(alloc, id, generation, .{ .width = 1, .height = 1, .pixel_format = .rgba, .data = &pixel });
+            }
+            try self.block_marker_placements.append(alloc, .{
+                .image_id = id,
+                .x = -@as(i32, @intCast(cells_left)),
+                .y = marker.first_row,
+                .z = 0,
+                .width = if (marker.color == .selected) width else @min(3, width),
+                .height = @as(u32, marker.end_row - marker.first_row) * viewport.cell.height -| 2,
+                .cell_offset_x = cells_left * cell_width - viewport.padding.left + 1,
+                .cell_offset_y = 1,
+                .source_x = 0,
+                .source_y = 0,
+                .source_width = 1,
+                .source_height = 1,
             });
         }
     }
@@ -287,7 +341,7 @@ pub const State = struct {
                         kv.value_ptr.image.markForUnload();
                     },
 
-                    .overlay => {},
+                    .overlay, .block_marker => {},
                 }
             }
         }
@@ -826,6 +880,8 @@ pub const Id = union(enum) {
     /// image for now. In the future we can support layers here if we want.
     overlay,
 
+    block_marker: BlockMarkers.Color,
+
     /// Z-ordering tie-breaker for images with the same z value.
     pub fn zLessThan(lhs: Id, rhs: Id) bool {
         // If our tags aren't the same, we sort by tag.
@@ -834,7 +890,7 @@ pub const Id = union(enum) {
                 // Kitty images always sort before (lower z) non-kitty images.
                 .kitty => true,
 
-                .overlay => false,
+                .overlay, .block_marker => false,
             };
         }
 
@@ -845,7 +901,7 @@ pub const Id = union(enum) {
             },
 
             // No sensical ordering
-            .overlay => return false,
+            .overlay, .block_marker => return false,
         }
     }
 };

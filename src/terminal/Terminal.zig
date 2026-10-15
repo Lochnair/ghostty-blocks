@@ -522,6 +522,66 @@ pub fn setScrollbackMaxLines(self: *Terminal, max: ?usize) void {
     primary.pages.setMaxLines(max);
 }
 
+/// Enable optional primary-screen command metadata without changing semantics.
+pub fn setCommandBlocks(self: *Terminal, enabled: bool) !void {
+    const screen = self.screens.get(.primary).?;
+    if (enabled == (screen.command_blocks != null)) return;
+    if (screen.command_blocks) |blocks| {
+        screen.command_blocks_next_id = blocks.next_id;
+        blocks.deinit(&screen.pages);
+        screen.alloc.destroy(blocks);
+        screen.command_blocks = null;
+    } else {
+        const CommandBlocks = @import("CommandBlocks.zig");
+        const blocks = try screen.alloc.create(CommandBlocks);
+        errdefer screen.alloc.destroy(blocks);
+        blocks.* = .init(screen.alloc);
+        blocks.next_id = screen.command_blocks_next_id;
+        errdefer blocks.deinit(&screen.pages);
+        try blocks.rebuildRanks(&screen.pages);
+        // One-time discovery on enable. Historical status/CWD cannot be
+        // reconstructed. No discovery work occurs during ordinary frames.
+        if (screen.semantic_prompt.seen) {
+            var node = screen.pages.pages.first;
+            while (node) |n| : (node = n.next) {
+                var preserved = try n.pagePreservingState(screen.alloc);
+                defer preserved.deinit();
+                const page = preserved.page();
+                for (0..n.rows()) |y| {
+                    if (page.getRow(@intCast(y)).semantic_prompt != .prompt) continue;
+                    const prompt = try screen.pages.trackPin(.{ .node = n, .y = @intCast(y) });
+                    errdefer screen.pages.untrackPin(prompt);
+                    try blocks.entries.append(screen.alloc, .{ .id = blocks.next_id, .prompt = prompt, .phase = .incomplete });
+                    blocks.next_id += 1;
+                }
+            }
+            if (blocks.entries.items.len > 0 and screen.cursor.semantic_content != .output) {
+                blocks.entries.items[blocks.entries.items.len - 1].phase = .editing;
+            }
+        }
+        screen.command_blocks = blocks;
+    }
+    self.flags.dirty.clear = true;
+}
+
+fn commandBlocksTouch(self: *Terminal) void {
+    if (self.screens.active_key != .primary or self.status_display != .main) return;
+    if (self.screens.active.command_blocks) |blocks| {
+        blocks.touch(self.screens.active) catch |err| {
+            log.warn("command block extent update failed err={}", .{err});
+        };
+    }
+}
+
+fn commandBlocksInvalidateActive(self: *Terminal) void {
+    if (self.screens.active_key != .primary) return;
+    if (self.screens.active.command_blocks) |blocks| {
+        blocks.invalidateActive(self.screens.active) catch |err| {
+            log.warn("command block invalidation failed err={}", .{err});
+        };
+    }
+}
+
 /// Print UTF-8 encoded string to the terminal.
 pub fn printString(self: *Terminal, str: []const u8) !void {
     const view = try std.unicode.Utf8View.init(str);
@@ -579,6 +639,7 @@ pub fn printRepeat(self: *Terminal, count_req: usize) !void {
 /// slower per-codepoint path. They're less common and this is optimized
 /// for the aforementioned cases.
 pub fn printSlice(self: *Terminal, cps: []const u32) !void {
+    defer self.commandBlocksTouch();
     // Check if we can do the fast path up front. If we can't
     // we need to go back to scalar `print`.
     const fast = fast: {
@@ -1252,6 +1313,7 @@ inline fn printSliceCheckExpected(style_id: style.Id) u64 {
 }
 
 pub fn print(self: *Terminal, c: u21) !void {
+    defer self.commandBlocksTouch();
     // log.debug("print={x} y={} x={}", .{ c, self.screens.active.cursor.y, self.screens.active.cursor.x });
 
     // If we're not on the main display, do nothing for now
@@ -1873,6 +1935,7 @@ pub fn carriageReturn(self: *Terminal) void {
 
 /// Linefeed moves the cursor to the next line.
 pub fn linefeed(self: *Terminal) !void {
+    defer self.commandBlocksTouch();
     try self.index();
     if (self.modes.get(.linefeed)) self.carriageReturn();
 }
@@ -2124,6 +2187,15 @@ pub fn semanticPrompt(
     self: *Terminal,
     cmd: osc.Command.SemanticPrompt,
 ) !void {
+    // Observe normalized events after upstream applies its semantic effects.
+    // N delegates to A below; do not observe it a second time.
+    defer if (cmd.action != .new_command and self.screens.active_key == .primary) {
+        if (self.screens.active.command_blocks) |blocks| {
+            blocks.observe(self.screens.active, cmd, self.getPwd()) catch |err| {
+                log.warn("command block metadata update failed err={}", .{err});
+            };
+        }
+    };
     switch (cmd.action) {
         .fresh_line => try self.semanticPromptFreshLine(),
 
@@ -2996,6 +3068,7 @@ fn invalidateFullWidthRowRange(
 ///
 /// Moves the cursor to the left margin.
 pub fn insertLines(self: *Terminal, count: usize) void {
+    defer self.commandBlocksInvalidateActive();
     // Rare, but happens
     if (count == 0) return;
 
@@ -3170,6 +3243,7 @@ pub fn insertLines(self: *Terminal, count: usize) void {
 ///
 /// Moves the cursor to the left margin.
 pub fn deleteLines(self: *Terminal, count: usize) void {
+    defer self.commandBlocksInvalidateActive();
     // Rare, but happens
     if (count == 0) return;
 
@@ -3536,6 +3610,7 @@ pub fn eraseLine(
     mode: csi.EraseLine,
     protected_req: bool,
 ) void {
+    defer self.commandBlocksInvalidateActive();
     // Get our start/end positions depending on mode.
     const start, const end = switch (mode) {
         .right => right: {
@@ -3621,6 +3696,7 @@ pub fn eraseDisplay(
     mode: csi.EraseDisplay,
     protected_req: bool,
 ) void {
+    defer self.commandBlocksInvalidateActive();
     // We respect protected attributes if explicitly requested (probably
     // a DECSEL sequence) or if our last protected mode was ISO even if its
     // not currently set.
@@ -4136,6 +4212,13 @@ pub fn resize(
     // and alt fails than the reverse.
     try tw.check(.primary_screen);
     const primary = self.screens.get(.primary).?;
+    const block_redraw = if (primary.command_blocks) |blocks|
+        if (primary.cursor.semantic_content != .output and blocks.entries.items.len > blocks.head)
+            blocks.entries.items[blocks.entries.items.len - 1].id
+        else
+            null
+    else
+        null;
     try primary.resize(.{
         .cols = opts.cols,
         .rows = opts.rows,
@@ -4143,6 +4226,13 @@ pub fn resize(
         .prompt_redraw = self.flags.shell_redraws_prompt,
         .pull_scrollback = self.flags.resize_pull_scrollback,
     });
+
+    if (primary.command_blocks) |blocks| {
+        blocks.redraw = block_redraw;
+        blocks.rebuildRanks(&primary.pages) catch |err| {
+            log.warn("command block reflow index failed err={}", .{err});
+        };
+    }
 
     // Alternate screen, if it exists, doesn't reflow. The primary resize
     // above can't be losslessly undone, so if the alternate resize fails we

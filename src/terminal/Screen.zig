@@ -83,6 +83,10 @@ else
 /// Semantic prompt (OSC133) state.
 semantic_prompt: SemanticPrompt = .disabled,
 
+/// Optional fork metadata; disabled screens allocate and track nothing.
+command_blocks: ?*@import("CommandBlocks.zig") = null,
+command_blocks_next_id: u64 = 1,
+
 /// Dirty flags for the renderer.
 dirty: Dirty = .{},
 
@@ -347,6 +351,10 @@ pub fn init(
 }
 
 pub fn deinit(self: *Screen) void {
+    if (self.command_blocks) |blocks| {
+        blocks.deinit(&self.pages);
+        self.alloc.destroy(blocks);
+    }
     if (comptime build_options.kitty_graphics) {
         self.kitty_images.deinit(self.alloc, self);
     }
@@ -427,6 +435,7 @@ pub fn memoryUsage(self: *const Screen) MemoryUsage {
 /// - Disables protection mode
 ///
 pub fn reset(self: *Screen) void {
+    if (self.command_blocks) |blocks| blocks.clear(&self.pages);
     // Reset our pages
     self.pages.reset();
 

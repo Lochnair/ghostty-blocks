@@ -96,6 +96,10 @@ pub const Options = struct {
     /// is currently only space characters (0x20).
     trim: bool = true,
 
+    /// Optional semantic-cell filter for command extraction. Null preserves
+    /// ordinary selection formatting. Excluded prompt cells emit no spaces.
+    semantic_content: ?Cell.SemanticContent = null,
+
     /// Replace matching Unicode codepoints with some other values.
     /// This will use the last matching range found in the list.
     codepoint_map: ?std.MultiArrayList(CodepointMap) = .{},
@@ -1045,6 +1049,9 @@ pub const PageFormatter = struct {
     pub const TrailingState = struct {
         rows: usize = 0,
         cells: usize = 0,
+        /// Semantic input already emitted on a prior page. This distinguishes
+        /// empty command continuation lines from leading multiline prompts.
+        semantic_started: bool = false,
 
         pub const empty: TrailingState = .{ .rows = 0, .cells = 0 };
     };
@@ -1090,6 +1097,7 @@ pub const PageFormatter = struct {
     ) std.Io.Writer.Error!TrailingState {
         var blank_rows: usize = 0;
         var blank_cells: usize = 0;
+        var semantic_started = false;
 
         // Continue our prior trailing state if we have it, but only if we're
         // starting from the beginning (start_y and start_x are both 0).
@@ -1098,6 +1106,7 @@ pub const PageFormatter = struct {
             if (self.start_y == 0 and self.start_x == 0) {
                 blank_rows = state.rows;
                 blank_cells = state.cells;
+                semantic_started = state.semantic_started;
             }
         }
 
@@ -1243,7 +1252,21 @@ pub const PageFormatter = struct {
             // If this row is blank, accumulate to avoid a bunch of extra
             // work later. If it isn't blank, make sure we dump all our
             // blanks.
-            if (!Cell.hasTextAny(cells_subset)) {
+            const has_text = if (self.opts.semantic_content) |content| blk: {
+                var has_content = false;
+                for (cells_subset) |cell| {
+                    if (cell.semantic_content != content) continue;
+                    has_content = true;
+                    if (cell.hasText()) {
+                        semantic_started = true;
+                        break :blk true;
+                    }
+                }
+                // Prompt-only rows aren't part of a multiline command.
+                if (!has_content and !(content == .input and semantic_started and row.semantic_prompt != .prompt)) continue;
+                break :blk false;
+            } else Cell.hasTextAny(cells_subset);
+            if (!has_text) {
                 blank_rows += 1;
                 continue;
             }
@@ -1320,6 +1343,10 @@ pub const PageFormatter = struct {
             while (cell_i < cells_subset.len) : (cell_i += 1) {
                 const cell: *const Cell = &cells_subset[cell_i];
                 const x: size.CellCountInt = @intCast(row_start_x + cell_i);
+
+                if (self.opts.semantic_content) |content| {
+                    if (cell.semantic_content != content) continue;
+                }
 
                 // Fast path: runs of simple cells (single codepoint, no
                 // style/hyperlink transitions) are encoded in batches,
@@ -1604,7 +1631,7 @@ pub const PageFormatter = struct {
             if (blank_rows >= 1) blank_rows -= 1;
         }
 
-        return .{ .rows = blank_rows, .cells = blank_cells };
+        return .{ .rows = blank_rows, .cells = blank_cells, .semantic_started = semantic_started };
     }
 
     /// Fast path for writing runs of simple cells: single-codepoint cells
@@ -1657,6 +1684,10 @@ pub const PageFormatter = struct {
         var i: usize = 0;
         while (i < cells.len) : (i += 1) {
             const cell = &cells[i];
+
+            if (self.opts.semantic_content) |content| {
+                if (cell.semantic_content != content) break;
+            }
 
             // Spacers produce no output, matching the slow path which
             // skips them before any blank/style handling.

@@ -1435,6 +1435,12 @@ input: RepeatableReadableIO = .{},
 /// already compressed remain compressed until their contents are accessed.
 @"scrollback-compression": bool = true,
 
+/// Identify shell commands using OSC 133 and display selectable markers in
+/// existing left window padding. This does not change padding, terminal
+/// columns, scrolling, or text selection. With insufficient left padding the
+/// markers are hidden; block copy binding actions remain available.
+@"command-blocks": bool = false,
+
 /// Control when the scrollbar is shown to scroll the scrollback buffer.
 ///
 /// The default value is `system`.

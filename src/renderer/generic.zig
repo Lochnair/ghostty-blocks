@@ -47,6 +47,7 @@ const DisplayLink = switch (builtin.os.tag) {
 };
 
 const log = std.log.scoped(.generic_renderer);
+const BlockMarkers = @import("BlockMarkers.zig");
 
 /// Create a renderer type with the provided graphics API wrapper.
 ///
@@ -1395,6 +1396,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
+                block_markers: []const BlockMarkers.Marker,
             };
 
             // Update all our data as tightly as possible within the mutex.
@@ -1549,6 +1551,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .preedit = preedit,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
+                    .block_markers = if (BlockMarkers.gutterWidth(self.size.padding.left) > 0)
+                        try BlockMarkers.snapshot(arena_alloc, state.terminal, &self.terminal_state, state.selected_block)
+                    else
+                        &.{},
                 };
             };
 
@@ -1639,6 +1645,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 defer self.draw_mutex.unlock(global.io());
 
                 // Build our GPU cells
+                self.images.blockMarkersUpdate(self.alloc, critical.block_markers, self.size) catch |err| {
+                    log.warn("error updating block markers err={}", .{err});
+                };
                 self.rebuildCells(
                     critical.preedit,
                     renderer.cursorStyle(&self.terminal_state, .{
@@ -1987,6 +1996,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     &pass,
                     .kitty_above_text,
                 );
+
+                // Production gutter decorations use the existing image pipeline.
+                self.images.draw(&self.api, self.shaders.pipelines.image, &pass, .block_markers);
 
                 // Debug overlay. We do this before any custom shader state
                 // because our debug overlay is aligned with the grid.

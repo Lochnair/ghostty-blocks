@@ -10,6 +10,7 @@
 //! runtime so the runtime can determine when and how those are delivered
 //! (i.e. with focus, without focus, and so on).
 const Surface = @This();
+const BlockMarkers = @import("renderer/BlockMarkers.zig");
 
 const apprt = @import("apprt.zig");
 pub const Mailbox = apprt.surface.Mailbox;
@@ -251,6 +252,7 @@ const Mouse = struct {
 
     /// True if the mouse is hidden
     hidden: bool = false,
+    block_gutter_press: bool = false,
 
     /// True if the mouse position is currently over a link.
     over_link: bool = false,
@@ -2143,6 +2145,79 @@ pub fn hasSelection(self: *const Surface) bool {
     return self.io.terminal.screens.active.selection != null;
 }
 
+/// Native Copy enablement includes block selection without changing text-only
+/// accessibility/selection APIs. No text extraction is performed here.
+pub fn hasBlockSelection(self: *Surface) bool {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    return self.io.terminal.screens.active.selection == null and self.selectedBlockLocked() != null;
+}
+
+fn selectedBlockLocked(self: *Surface) ?terminal.CommandBlocks.Id {
+    const t = &self.io.terminal;
+    if (t.screens.active_key != .primary) return null;
+    const blocks = t.screens.active.command_blocks orelse return null;
+    blocks.reconcile(&t.screens.active.pages);
+    const id = self.renderer_state.selected_block orelse return null;
+    return if (blocks.get(id) != null) id else null;
+}
+
+/// All block copy actions share this path. Snapshot one page with the terminal
+/// lock held, then release it before upstream text encoding and clipboard IO.
+fn copyBlock(self: *Surface, id_: ?terminal.CommandBlocks.Id, part: terminal.CommandBlocks.Part) !bool {
+    var request = request: {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        const t = &self.io.terminal;
+        if (t.screens.active_key != .primary) return false;
+        const blocks = t.screens.active.command_blocks orelse return false;
+        blocks.reconcile(&t.screens.active.pages);
+        const id = id_ orelse self.selectedBlockLocked() orelse recent: {
+            var i = blocks.entries.items.len;
+            while (i > blocks.head) {
+                i -= 1;
+                if (blocks.entries.items[i].phase != .editing) break :recent blocks.entries.items[i].id;
+            }
+            return false;
+        };
+        break :request try blocks.extract(t.screens.active, id, part);
+    };
+    defer {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        request.deinit(&self.io.terminal.screens.get(.primary).?.pages);
+    }
+    var aw: std.Io.Writer.Allocating = .init(self.alloc);
+    defer aw.deinit();
+    if (request.initial) |v| try aw.writer.writeAll(v);
+    const opts: terminal.formatter.Options = .{
+        .emit = .plain,
+        .unwrap = true,
+        .trim = self.config.clipboard_trim_trailing_spaces,
+        .codepoint_map = self.config.clipboard_codepoint_map.map.list,
+    };
+    while (true) {
+        var chunk = chunk: {
+            self.renderer_state.lockDemand(global.io());
+            defer self.renderer_state.unlockDemand(global.io());
+            break :chunk (try request.capture(&self.io.terminal.screens.get(.primary).?.pages)) orelse break;
+        };
+        defer chunk.deinit();
+        try request.formatChunk(&chunk, opts, &aw.writer);
+    }
+    if (aw.written().len == 0) return false;
+    const text = try aw.toOwnedSliceSentinel(0);
+    defer self.alloc.free(text);
+    try self.rt_surface.setClipboard(.standard, &.{.{ .mime = "text/plain", .data = text }}, false);
+    if (self.config.selection_clear_on_copy) {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        try self.setSelection(null);
+        try self.queueRender();
+    }
+    return true;
+}
+
 /// Returns the selected text. This is allocated.
 pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
     self.renderer_state.mutex.lockUncancelable(global.io());
@@ -2423,6 +2498,8 @@ fn copySelectionToClipboards(
 ///
 /// This must be called with the renderer mutex held.
 fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
+    const had_block = self.renderer_state.selected_block != null;
+    self.renderer_state.selected_block = null;
     // Compute the transition before `select` below, which untracks (frees)
     // the previous selection's tracked pins; reading them after would be a
     // use-after-free.
@@ -2435,7 +2512,7 @@ fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
 
     try self.io.terminal.screens.active.select(sel_);
 
-    if (changed) {
+    if (changed or had_block) {
         _ = self.rt_app.performAction(
             .{ .surface = self },
             .selection_changed,
@@ -2812,6 +2889,16 @@ pub fn keyCallback(
         event,
         if (insp_ev) |*ev| ev else null,
     )) |v| return v;
+
+    if (event.action == .press and event.key == .escape) {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        if (self.selectedBlockLocked() != null) {
+            try self.setSelection(null);
+            try self.queueRender();
+            return .consumed;
+        }
+    }
     // If we allow KAM and KAM is enabled then we do nothing.
     if (self.config.vt_kam_allowed) {
         self.renderer_state.mutex.lockUncancelable(global.io());
@@ -2941,7 +3028,7 @@ pub fn keyCallback(
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
 
-        if (self.config.selection_clear_on_typing or
+        if ((self.io.terminal.screens.active_key == .primary and self.renderer_state.selected_block != null) or self.config.selection_clear_on_typing or
             event.key == .escape)
         {
             try self.setSelection(null);
@@ -3920,6 +4007,33 @@ pub fn mouseButtonCallback(
     // locking/unlocking but clicking isn't that frequent enough to be a
     // bottleneck.
     const shift_capture = self.mouseShiftCapture(true);
+
+    // Gutter events never become terminal-cell selection, prompt clicks, or
+    // terminal mouse reports. Alternate-screen applications bypass this path.
+    if (button == .left and self.mouse.block_gutter_press and action == .release) {
+        self.mouse.block_gutter_press = false;
+        return true;
+    }
+    if (button == .left and action == .press) {
+        const pos = try self.rt_surface.getCursorPos();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        const t = &self.io.terminal;
+        if (t.screens.active_key == .primary and t.screens.active.command_blocks != null and !self.isMouseReporting()) {
+            if (BlockMarkers.hitGutter(self.size, pos.x, pos.y)) |y| {
+                const screen = t.screens.active;
+                const pin = screen.pages.pin(.{ .viewport = .{ .y = y } }).?;
+                const e = try screen.command_blocks.?.atPin(&screen.pages, pin, screen.cursor.page_pin.*);
+                try self.setSelection(null);
+                self.renderer_state.selected_block = if (e) |entry| entry.id else null;
+                self.mouse.selection_gesture.reset(t);
+                self.mouse.block_gutter_press = true;
+                _ = try self.rt_app.performAction(.{ .surface = self }, .selection_changed, {});
+                try self.queueRender();
+                return true;
+            }
+        }
+    }
 
     // Shift-click continues the previous mouse state if we have a selection.
     // cursorPosCallback will also do a mouse report so we don't need to do any
@@ -5127,31 +5241,33 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             s.state.wakeup.notify() catch {};
         },
 
+        .copy_block => |part| return try self.copyBlock(null, switch (part) {
+            .command => .command,
+            .output => .output,
+            .block => .block,
+            .cwd => .cwd,
+        }),
+
         .copy_to_clipboard => |format| {
-            self.renderer_state.mutex.lockUncancelable(global.io());
-            defer self.renderer_state.mutex.unlock(global.io());
-
-            if (self.io.terminal.screens.active.selection) |sel| {
-                try self.copySelectionToClipboards(
-                    sel,
-                    &.{.standard},
-                    format,
-                );
-
-                // Clear the selection if configured to do so.
-                if (self.config.selection_clear_on_copy) {
-                    if (self.setSelection(null)) {
-                        self.queueRender() catch |err| {
-                            log.warn("failed to queue render after clear selection err={}", .{err});
-                        };
-                    } else |err| {
-                        log.warn("failed to clear selection after copy err={}", .{err});
+            const block_id = block: {
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
+                if (self.io.terminal.screens.active.selection) |sel| {
+                    try self.copySelectionToClipboards(sel, &.{.standard}, format);
+                    if (self.config.selection_clear_on_copy) {
+                        if (self.setSelection(null)) {
+                            self.queueRender() catch |err| {
+                                log.warn("failed to queue render after clear selection err={}", .{err});
+                            };
+                        } else |err| {
+                            log.warn("failed to clear selection after copy err={}", .{err});
+                        }
                     }
+                    return true;
                 }
-
-                return true;
-            }
-
+                break :block self.selectedBlockLocked();
+            };
+            if (block_id) |id| return try self.copyBlock(id, .block);
             return false;
         },
 

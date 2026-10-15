@@ -1902,6 +1902,10 @@ pub const CAPI = struct {
         return surface.core_surface.hasSelection();
     }
 
+    export fn ghostty_surface_has_block_selection(surface: *Surface) bool {
+        return surface.core_surface.hasBlockSelection();
+    }
+
     /// Same as ghostty_surface_read_text but reads from the user selection,
     /// if any.
     export fn ghostty_surface_read_selection(

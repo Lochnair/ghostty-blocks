@@ -2269,6 +2269,9 @@ extension Ghostty.SurfaceView: NSMenuItemValidation {
             return true
 
         case #selector(copy(_:)):
+            if let surface, ghostty_surface_has_block_selection(surface) {
+                return true
+            }
             // We only enable copy menu item when there're actual selected text
             if let text = self.accessibilitySelectedText(), text.count > 0 {
                 return true

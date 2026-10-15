@@ -372,6 +372,10 @@ pub const Action = union(enum) {
     ///     representation when pasting.
     copy_to_clipboard: CopyToClipboard,
 
+    /// Copy command, output, full block, or working directory from the selected
+    /// block (or most recent executed block). Requires command-blocks.
+    copy_block: CopyBlock,
+
     /// Paste the contents of the default clipboard.
     paste_from_clipboard,
 
@@ -1117,6 +1121,15 @@ pub const Action = union(enum) {
         u16,
     };
 
+    pub const CopyBlock = enum {
+        command,
+        output,
+        block,
+        cwd,
+
+        pub const default: CopyBlock = .block;
+    };
+
     pub const CopyToClipboard = enum {
         plain,
         vt,
@@ -1389,6 +1402,7 @@ pub const Action = union(enum) {
             .end_search,
             .reset,
             .copy_to_clipboard,
+            .copy_block,
             .copy_url_to_clipboard,
             .copy_title_to_clipboard,
             .paste_from_clipboard,
@@ -4581,6 +4595,17 @@ test "parse: copy to clipboard explicit" {
         try testing.expect(binding.action == .copy_to_clipboard);
         try testing.expectEqual(Action.CopyToClipboard.html, binding.action.copy_to_clipboard);
     }
+}
+
+test "parse: command block copy actions" {
+    const testing = std.testing;
+    inline for (std.enums.values(Action.CopyBlock)) |part| {
+        const binding = try parseSingle("a=copy_block:" ++ @tagName(part));
+        try testing.expectEqual(part, binding.action.copy_block);
+        try testing.expectEqual(Action.Scope.surface, binding.action.scope());
+    }
+    const default = try parseSingle("a=copy_block");
+    try testing.expectEqual(Action.CopyBlock.block, default.action.copy_block);
 }
 
 test "parse: write screen file no format" {

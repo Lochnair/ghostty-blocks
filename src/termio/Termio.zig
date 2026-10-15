@@ -196,6 +196,7 @@ pub const DerivedConfig = struct {
     xt_checksum_report: bool,
     xt_checksum_extension: terminalpkg.xt_checksum.Flags,
     conditional_state: configpkg.ConditionalState,
+    command_blocks: bool,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -235,6 +236,7 @@ pub const DerivedConfig = struct {
             .xt_checksum_report = config.@"vt-xt-checksum-report",
             .xt_checksum_extension = xtChecksumFlags(config.@"vt-xt-checksum-extension"),
             .conditional_state = config._conditional_state,
+            .command_blocks = config.@"command-blocks",
 
             // This has to be last so that we copy AFTER the arena allocations
             // above happen (Zig assigns in order).
@@ -300,6 +302,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
     // The default palette may be an allocator-owned copy, so it is set
     // once the terminal owns its memory and can release it on deinit.
     try term.colors.palette.changeDefault(alloc, opts.config.palette);
+    try term.setCommandBlocks(opts.config.command_blocks);
 
     // Setup our terminal size in pixels for certain requests.
     term.width_px = term.cols * opts.size.cell.width;
@@ -474,6 +477,7 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     // stream handler may be referencing the old config (i.e. enquiry resp)
     self.config.deinit();
     self.config = config.*;
+    try self.terminal.setCommandBlocks(config.command_blocks);
 
     // Update our stream handler. The stream handler uses the same
     // renderer mutex so this is safe to do despite being executed

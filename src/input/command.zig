@@ -168,6 +168,13 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = i18n.N_("Copy the selected text as HTML to the clipboard."),
         } },
 
+        .copy_block => comptime &.{
+            .{ .action = .{ .copy_block = .command }, .title = i18n.N_("Copy Command"), .description = i18n.N_("Copy the selected or most recent command without its prompt.") },
+            .{ .action = .{ .copy_block = .output }, .title = i18n.N_("Copy Command Output"), .description = i18n.N_("Copy the selected or most recent command's output.") },
+            .{ .action = .{ .copy_block = .block }, .title = i18n.N_("Copy Command Block"), .description = i18n.N_("Copy the command and its output.") },
+            .{ .action = .{ .copy_block = .cwd }, .title = i18n.N_("Copy Command Working Directory"), .description = i18n.N_("Copy the command's working directory.") },
+        },
+
         .copy_url_to_clipboard => comptime &.{.{
             .action = .copy_url_to_clipboard,
             .title = i18n.N_("Copy URL to Clipboard"),

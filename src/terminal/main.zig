@@ -50,6 +50,7 @@ pub const Pin = PageList.Pin;
 pub const Point = point.Point;
 pub const RenderState = render.RenderState;
 pub const Screen = @import("Screen.zig");
+pub const CommandBlocks = @import("CommandBlocks.zig");
 pub const ScreenSet = @import("ScreenSet.zig");
 pub const Scrollbar = PageList.Scrollbar;
 pub const Selection = @import("Selection.zig");
